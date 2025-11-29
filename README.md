@@ -1,1 +1,2 @@
 # LLMTalkMAnager
+ок
