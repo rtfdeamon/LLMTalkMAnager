@@ -37,10 +37,12 @@ class SileroTTSService(TTSService):
         logger.info("Loading Silero TTS model: language=%s speaker=%s", self._language, self._speaker)
         try:
             self._model, _ = torch.hub.load(
-                repo_or_dir="snakers4/silero-models",
+                repo_or_dir="/home/dmitriy/projects/GitHub/AutoTalkMAnager/snakers4-silero-models-168386c",
+                source="local",
                 model="silero_tts",
                 language=self._language,
                 speaker="v5_ru",
+                trust_repo=True,
             )
             self._model.to(self._device)
             logger.info("Silero TTS model loaded successfully")

@@ -1,0 +1,10 @@
+pipecat-ai
+fastapi
+uvicorn
+faster-whisper
+websockets
+torch
+torchaudio
+python-dotenv
+aiohttp
+numpy

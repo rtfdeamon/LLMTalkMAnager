@@ -1,99 +1,163 @@
-"""
-Entry point that wires together local STT/LLM/TTS services for Pipecat.
-"""
 import asyncio
 import logging
-import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from dotenv import load_dotenv
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.sentence import SentenceAggregator
-from pipecat.transports.services.daily import DailyParams, DailyTransport
-
-from services.faster_whisper_service import FasterWhisperSTTService
 from services.ollama_service import CustomOllamaLLMService
 from services.silero_tts_service import SileroTTSService
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LocalVoiceBot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Global services
+_llm = None
+_tts = None
 
 
-def _build_transport() -> DailyTransport:
-    load_dotenv()
+@app.on_event("startup")
+async def startup_event():
+    """Preload AI models at server startup"""
+    global _llm, _tts
+    
+    logger.info("=" * 60)
+    logger.info("🚀 STARTING SERVER - TEXT CHAT MODE")
+    logger.info("=" * 60)
+    
+    logger.info("📥 Loading LLM (Qwen2.5 7B)...")
+    _llm = CustomOllamaLLMService(model="qwen2.5:7b", base_url="http://localhost:11434/v1", num_ctx=4096)
+    logger.info("✅ LLM Ready (Qwen2.5)")
+    
+    logger.info("📥 TTS switched to Edge-TTS (Natural Voice)...")
+    # _tts = SileroTTSService(language="ru", speaker="xenia", sample_rate=24000, device="cpu")
+    logger.info("✅ TTS Ready (Edge-TTS)")
+    
+    logger.info("=" * 60)
+    logger.info("🎉 SERVER READY - Type to chat, voice coming soon!")
+    logger.info("=" * 60)
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("✅ Client connected!")
+    
+    # Send component statuses
+    await websocket.send_text("status:✅ STT: Browser (Ready)")
+    await websocket.send_text("status:✅ LLM: Ready")
+    await websocket.send_text("status:✅ TTS: Ready (Edge-TTS)")
+    
+    await websocket.send_text("status:✅ Ready! Type a message to chat.")
+    await websocket.send_text("progress:100")
+    
     try:
-        transport = DailyTransport(
-            room_url=os.getenv("DAILY_ROOM_URL"),
-            token=os.getenv("DAILY_TOKEN"),
-            bot_name="Локальный Ассистент",
-            params=DailyParams(
-                audio_in_sample_rate=16000,
-                audio_out_sample_rate=24000,
-                camera_out_enabled=False,
-                vad_enabled=True,
-                vad_audio_passthrough=True,
-            ),
-        )
-        logger.info("Daily transport initialized")
-        return transport
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("Failed to initialize Daily transport: %s", exc)
-        raise
+        while True:
+            # Receive text message from client
+            message = await websocket.receive_text()
+            
+            if message.startswith("text:"):
+                user_text = message[5:]
+                logger.info(f"📝 User: {user_text}")
+                
+                # Streaming LLM + Sentence-level TTS
+                import httpx
+                import io
+                import re
+                import os
+                import edge_tts
+                
+                # Helper for Edge-TTS (Async)
+                async def generate_audio_edge(text):
+                    try:
+                        # Use a high-quality Russian voice
+                        voice = "ru-RU-DmitryNeural" # or ru-RU-SvetlanaNeural
+                        communicate = edge_tts.Communicate(text, voice)
+                        
+                        # Save to temp file (Edge-TTS writes to file)
+                        temp_file = f"temp_{os.getpid()}_{id(text)}.mp3"
+                        await communicate.save(temp_file)
+                        
+                        if os.path.exists(temp_file):
+                            with open(temp_file, "rb") as f:
+                                audio_bytes = f.read()
+                            os.remove(temp_file)
+                            return audio_bytes
+                    except Exception as e:
+                        logger.error(f"Edge-TTS Error: {e}")
+                    return None
 
-
-def _build_pipeline() -> Pipeline:
-    try:
-        pipeline = Pipeline()
-        SentenceAggregator(pipeline)
-        logger.info("Pipeline with SentenceAggregator created")
-        return pipeline
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("Failed to create pipeline: %s", exc)
-        raise
-
-
-def _build_services() -> tuple[SileroVADAnalyzer, FasterWhisperSTTService, CustomOllamaLLMService, SileroTTSService]:
-    try:
-        vad_analyzer = SileroVADAnalyzer()
-        stt = FasterWhisperSTTService(model_size="small", device="cuda", language="ru")
-        llm = CustomOllamaLLMService(model="llama3", base_url="http://localhost:11434/v1", num_ctx=4096)
-        tts = SileroTTSService(language="ru", speaker="xenia", sample_rate=24000, device="cpu")
-        logger.info("Services initialized successfully")
-        return vad_analyzer, stt, llm, tts
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("Failed to initialize services: %s", exc)
-        raise
-
-
-async def _run_task(runner: PipelineRunner, task: PipelineTask) -> None:
-    try:
-        await runner.run(task)
-    except asyncio.CancelledError:
-        logger.info("Pipeline task cancelled")
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("Pipeline task failed: %s", exc)
-        raise
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        "http://localhost:11434/v1/chat/completions",
+                        json={
+                            "model": "qwen2.5:7b",
+                            "messages": [
+                                {"role": "system", "content": "Ты - голосовой ассистент. Твоя главная задача - говорить ИСКЛЮЧИТЕЛЬНО на русском языке. Даже если тебя спрашивают на английском или другом языке, ты ОБЯЗАН отвечать только на русском. Никогда не используй английские слова. Отвечай кратко, емко и дружелюбно."},
+                                {"role": "user", "content": user_text}
+                            ],
+                            "stream": True
+                        },
+                        timeout=120.0
+                    ) as response:
+                        buffer = ""
+                        full_response = ""
+                        
+                        async for line in response.aiter_lines():
+                            if not line or line == "data: [DONE]":
+                                continue
+                            
+                            if line.startswith("data: "):
+                                import json
+                                try:
+                                    data = json.loads(line[6:])
+                                    if "content" in data["choices"][0]["delta"]:
+                                        token = data["choices"][0]["delta"]["content"]
+                                        buffer += token
+                                        full_response += token
+                                        
+                                        # Check for sentence delimiters
+                                        if re.search(r'[.!?\n]', token):
+                                            # Find the last sentence end
+                                            match = re.search(r'(.*[.!?\n])', buffer)
+                                            if match:
+                                                sentence = match.group(1).strip()
+                                                if sentence:
+                                                    logger.info(f"🗣️ Speaking: {sentence}")
+                                                    await websocket.send_text(f"bot:{sentence}")
+                                                    
+                                                    # Generate TTS for this sentence (Edge-TTS)
+                                                    audio_bytes = await generate_audio_edge(sentence)
+                                                    if audio_bytes:
+                                                        await websocket.send_bytes(audio_bytes)
+                                                
+                                                # Keep the rest of the buffer
+                                                buffer = buffer[len(match.group(1)):]
+                                except Exception as e:
+                                    logger.error(f"Error parsing stream: {e}")
+                        
+                        # Process remaining buffer
+                        if buffer.strip():
+                            logger.info(f"🗣️ Speaking (final): {buffer}")
+                            await websocket.send_text(f"bot:{buffer}")
+                            
+                            audio_bytes = await generate_audio_edge(buffer)
+                            if audio_bytes:
+                                await websocket.send_bytes(audio_bytes)
+                            
+                        logger.info(f"🤖 Full response: {full_response}")
+                
+    except WebSocketDisconnect:
+        logger.info("Client disconnected")
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
     finally:
-        logger.info("Pipeline task completed")
-
-
-async def main() -> None:
-    transport = _build_transport()
-    pipeline = _build_pipeline()
-    vad_analyzer, stt, llm, tts = _build_services()
-
-    runner = PipelineRunner()
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
-        transport=transport,
-    )
-
-    await _run_task(runner, task)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    # TODO: register graceful signal handling for long-running deployments.
+        logger.info("Connection closed")

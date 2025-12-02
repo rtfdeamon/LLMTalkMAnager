@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Voice Bot</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify_content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5;
+            color: #333;
+        }
+
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            max-width: 400px;
+            width: 100%;
+        }
+
+        h1 {
+            margin-bottom: 2rem;
+            color: #1a73e8;
+        }
+
+        button {
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 24px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin: 10px;
+        }
+
+        button:hover {
+            background-color: #1557b0;
+        }
+
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+        #status {
+            margin-top: 1rem;
+            font-weight: bold;
+        }
+
+        .recording {
+            background-color: #ea4335;
+        }
+
+        .recording:hover {
+            background-color: #d93025;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Local Voice Bot</h1>
+        <div id="controls">
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+        <p id="status">Disconnected</p>
+
+        <div style="margin-top: 15px; width: 100%;">
+            <div style="background: #e0e0e0; border-radius: 10px; height: 30px; overflow: hidden;">
+                <div id="progress-bar"
+                    style="background: linear-gradient(90deg, #1a73e8, #34a853); height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="components" style="margin-top: 20px; font-size: 14px; text-align: left;">
+            <div style="margin: 5px 0;"><strong>Components:</strong></div>
+            <div id="stt-status">🔘 STT: Not loaded</div>
+            <div id="llm-status">🔘 LLM: Not loaded</div>
+            <div id="tts-status">🔘 TTS: Not loaded</div>
+        </div>
+    </div>
+
+    <script>
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const status = document.getElementById('status');
+        const progressBar = document.getElementById('progress-bar');
+        const progressText = document.getElementById('progress-text');
+
+        let ws;
+        let audioContext;
+        let recognition;
+        let isConnected = false;
+
+        // Audio Queue System
+        let audioQueue = [];
+        let isPlaying = false;
+
+        // Initialize Web Speech API
+        if ('webkitSpeechRecognition' in window) {
+            recognition = new webkitSpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.lang = 'ru-RU';
+
+            recognition.onstart = () => {
+                console.log("Microphone activated");
+                if (!isPlaying) {
+                    status.textContent = "Listening... (Speak now)";
+                    document.getElementById('stt-status').textContent = "✅ STT: Listening (Browser)";
+                }
+            };
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[event.results.length - 1][0].transcript;
+                console.log("Recognized:", transcript);
+                status.textContent = `You said: "${transcript}"`;
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(`text:${transcript}`);
+                }
+            };
+
+            recognition.onerror = (event) => {
+                if (event.error === 'no-speech') return; // Ignore no-speech errors
+                if (event.error === 'aborted') return;   // Ignore intentional aborts
+                console.error("Speech recognition error", event.error);
+                status.textContent = `Error: ${event.error}`;
+            };
+
+            recognition.onend = () => {
+                // Only restart if we are connected AND NOT playing audio
+                if (isConnected && !isPlaying) {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        console.log("Recognition already started");
+                    }
+                }
+            };
+        } else {
+            alert("Web Speech API not supported. Please use Chrome.");
+        }
+
+        connectBtn.onclick = async () => {
+            try {
+                status.textContent = "Connecting...";
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+                ws.onopen = () => {
+                    isConnected = true;
+                    status.textContent = "Connected";
+                    connectBtn.disabled = true;
+                    disconnectBtn.disabled = false;
+                    if (recognition) recognition.start();
+                };
+
+                ws.onmessage = async (event) => {
+                    if (typeof event.data === 'string') {
+                        console.log('Server:', event.data);
+
+                        if (event.data.startsWith('progress:')) {
+                            const progress = parseInt(event.data.substring(9));
+                            progressBar.style.width = progress + '%';
+                            progressText.textContent = progress + '%';
+                        }
+
+                        if (event.data.startsWith('status:')) {
+                            const statusText = event.data.substring(7);
+                            if (statusText.includes('STT') || statusText.includes('LLM') || statusText.includes('TTS')) {
+                                if (statusText.includes('STT')) document.getElementById('stt-status').textContent = statusText;
+                                if (statusText.includes('LLM')) document.getElementById('llm-status').textContent = statusText;
+                                if (statusText.includes('TTS')) document.getElementById('tts-status').textContent = statusText;
+                            } else if (statusText.startsWith('bot:')) {
+                                status.textContent = `Bot: ${statusText.substring(4)}`;
+                            } else {
+                                status.textContent = statusText;
+                            }
+                        }
+                        return;
+                    }
+
+                    // Received Audio Binary
+                    const arrayBuffer = await event.data.arrayBuffer();
+                    queueAudio(arrayBuffer);
+                };
+
+                ws.onclose = () => {
+                    cleanup();
+                    status.textContent = "Disconnected";
+                };
+
+            } catch (err) {
+                console.error("Connection failed:", err);
+                status.textContent = "Connection Failed: " + err.message;
+            }
+        };
+
+        disconnectBtn.onclick = () => {
+            if (ws) ws.close();
+            cleanup();
+        };
+
+        function queueAudio(arrayBuffer) {
+            audioQueue.push(arrayBuffer);
+            if (!isPlaying) {
+                playNextInQueue();
+            }
+        }
+
+        function playNextInQueue() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                // Resume listening when audio finishes
+                if (isConnected && recognition) {
+                    console.log("Audio finished, resuming mic...");
+                    status.textContent = "Listening... (Speak now)";
+                    try { recognition.start(); } catch (e) { }
+                }
+                return;
+            }
+
+            isPlaying = true;
+
+            // Stop listening while speaking to prevent echo
+            if (recognition) {
+                console.log("Bot speaking, stopping mic...");
+                recognition.abort();
+                document.getElementById('stt-status').textContent = "🔇 STT: Paused (Bot Speaking)";
+            }
+
+            const arrayBuffer = audioQueue.shift();
+
+            audioContext.decodeAudioData(arrayBuffer, (buffer) => {
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+
+                source.onended = () => {
+                    playNextInQueue();
+                };
+
+                source.start(0);
+            }, (e) => {
+                console.error("Error decoding audio", e);
+                playNextInQueue(); // Skip bad chunk
+            });
+        }
+
+        function cleanup() {
+            isConnected = false;
+            isPlaying = false;
+            audioQueue = [];
+            if (recognition) recognition.stop();
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
+            document.getElementById('stt-status').textContent = "🔘 STT: Not loaded";
+        }
+    </script>
+</body>
+
+</html>
